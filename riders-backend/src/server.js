@@ -115,7 +115,12 @@ app.post("/api/book", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`Backend Riders Barber Shop en écoute sur le port ${PORT}`);
-});
+// Local/dev: start HTTP server. On Vercel, the exported app is used as a serverless handler.
+if (require.main === module) {
+  const PORT = process.env.PORT || 3001;
+  app.listen(PORT, () => {
+    console.log(`Backend Riders Barber Shop en écoute sur le port ${PORT}`);
+  });
+}
+
+module.exports = app;

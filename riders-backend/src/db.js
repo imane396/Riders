@@ -1,55 +1,63 @@
-const fs = require("fs");
-const path = require("path");
-const Database = require("better-sqlite3");
+const { createClient } = require("@supabase/supabase-js");
 
-const DEFAULT_DB_PATH = path.join(__dirname, "..", "data", "riders.sqlite");
+let supabase;
 
-let db;
+class UniqueViolationError extends Error {
+  constructor(message = "slot_unavailable") {
+    super(message);
+    this.name = "UniqueViolationError";
+    this.code = "23505";
+  }
+}
+
+function isUniqueViolation(error) {
+  if (!error) return false;
+  if (error instanceof UniqueViolationError) return true;
+  if (error.code === "23505") return true;
+  const msg = String(error.message || "");
+  return (
+    msg.includes("bookings_unique_slot_confirmed") ||
+    msg.toLowerCase().includes("duplicate key")
+  );
+}
 
 /**
- * Opens (or creates) the local SQLite database and ensures the bookings schema exists.
- * @param {string} [dbPath]
- * @returns {import("better-sqlite3").Database}
+ * Initializes the Supabase admin client (server-side only).
+ * Requires SUPABASE_URL + SUPABASE_SECRET_KEY.
  */
-function initDb(dbPath = process.env.SQLITE_PATH || DEFAULT_DB_PATH) {
-  const resolved = path.resolve(dbPath);
-  fs.mkdirSync(path.dirname(resolved), { recursive: true });
+function initDb() {
+  const url = process.env.SUPABASE_URL;
+  const secretKey = process.env.SUPABASE_SECRET_KEY;
 
-  db = new Database(resolved);
-  db.pragma("journal_mode = WAL");
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS bookings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      google_event_id TEXT,
-      barber TEXT NOT NULL,
-      service TEXT NOT NULL,
-      booking_date TEXT NOT NULL,
-      start_time TEXT NOT NULL,
-      end_time TEXT NOT NULL,
-      customer_name TEXT NOT NULL,
-      customer_phone TEXT,
-      customer_email TEXT,
-      status TEXT NOT NULL DEFAULT 'confirmed',
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  if (!url || !secretKey) {
+    throw new Error(
+      "Missing Supabase credentials: set SUPABASE_URL and SUPABASE_SECRET_KEY in .env"
     );
-  `);
+  }
 
-  return db;
+  supabase = createClient(url, secretKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+
+  return supabase;
 }
 
 function getDb() {
-  if (!db) {
+  if (!supabase) {
     throw new Error("Database not initialized. Call initDb() first.");
   }
-  return db;
+  return supabase;
 }
 
 /**
- * Inserts a confirmed booking row. Throws on failure.
- * @returns {{ id: number }}
+ * Inserts a confirmed booking row into public.bookings.
+ * Throws UniqueViolationError on bookings_unique_slot_confirmed conflicts.
+ * @returns {Promise<{ id: number }>}
  */
-function insertBooking({
+async function insertBooking({
   googleEventId,
   barber,
   service,
@@ -61,30 +69,46 @@ function insertBooking({
   customerEmail,
   status = "confirmed",
 }) {
-  const info = getDb()
-    .prepare(
-      `INSERT INTO bookings (
-        google_event_id, barber, service, booking_date, start_time, end_time,
-        customer_name, customer_phone, customer_email, status
-      ) VALUES (
-        @googleEventId, @barber, @service, @bookingDate, @startTime, @endTime,
-        @customerName, @customerPhone, @customerEmail, @status
-      )`
-    )
-    .run({
-      googleEventId,
+  const client = getDb();
+
+  const { data, error } = await client
+    .from("bookings")
+    .insert({
+      google_event_id: googleEventId,
       barber,
       service,
-      bookingDate,
-      startTime,
-      endTime,
-      customerName,
-      customerPhone: customerPhone ?? null,
-      customerEmail: customerEmail ?? null,
+      booking_date: bookingDate,
+      start_time: startTime,
+      end_time: endTime,
+      customer_name: customerName,
+      customer_phone: customerPhone ?? null,
+      customer_email: customerEmail ?? null,
       status,
-    });
+    })
+    .select("id")
+    .single();
 
-  return { id: Number(info.lastInsertRowid) };
+  if (error) {
+    if (isUniqueViolation(error)) {
+      throw new UniqueViolationError(error.message);
+    }
+    const err = new Error(error.message || "Supabase insert failed");
+    err.code = error.code;
+    err.cause = error;
+    throw err;
+  }
+
+  if (!data || data.id == null) {
+    throw new Error("Supabase insert succeeded but returned no booking id");
+  }
+
+  return { id: Number(data.id) };
 }
 
-module.exports = { initDb, getDb, insertBooking, DEFAULT_DB_PATH };
+module.exports = {
+  initDb,
+  getDb,
+  insertBooking,
+  UniqueViolationError,
+  isUniqueViolation,
+};
